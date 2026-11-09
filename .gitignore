@@ -1,0 +1,14 @@
+/target/
+# artefakty testów i runtime'u — nie publikować
+*.log
+/brave-browser.repo
+/brave-browser.sources
+/claude-test-profile/
+/prefix-claude
+/test/prefix/
+/test/prefix-jq/
+/test/prefix-claude/
+/test/gtest
+/test/selfexe
+/test/eglinfo
+/test/es2gears_wayland
