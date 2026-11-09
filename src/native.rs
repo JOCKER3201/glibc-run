@@ -336,18 +336,17 @@ pub fn run(
         bind_rootfs(rf, rf, verbose);
     }
 
-    // LD_LIBRARY_PATH: w trybie natywnym glibc-owe biblioteki 64-bit są
-    // widoczne przez overlay na /usr/lib (domyślna ścieżka loadera), więc NIE
-    // wolno ich dublować w env — musl-owe dzieci (python/ctypes→libffi,
-    // narzędzia→libcrypto) ładowałyby glibc-owe odpowiedniki i ginęły.
-    // Zostaje wyłącznie lib32 (32-bitowy glibc nie ma jej w domyślnych
-    // ścieżkach; loadery 64-bit i musl pomijają złą klasę ELF) oraz jawne
-    // katalogi użytkownika z --lib.
+    // LD_LIBRARY_PATH: w trybie natywnym WSZYSTKIE biblioteki glibc (64- i
+    // 32-bit) rozwiązuje /etc/ld.so.cache — loadery glibc czytają cache i same
+    // wybierają wpis o właściwej klasie ELF. NIE wolno dokładać tu katalogów
+    // glibc (ani lib, ani lib32): musl-owy loader TEŻ czyta LD_LIBRARY_PATH i —
+    // wbrew częstemu założeniu — NIE pomija pliku o złej klasie ELF, tylko
+    // zwraca ENOEXEC na pierwszym trafieniu po nazwie. lib32 z Compat.i386
+    // niesie m.in. 32-bitowe libreadline/libtinfo o tych samych sonamkach co
+    // host-owe musl-owe; przez LD_LIBRARY_PATH zabijały każde musl-owe dziecko
+    // (np. bash: „libreadline.so.8: Exec format error"). Zostają wyłącznie
+    // jawne katalogi użytkownika z --lib — to jego świadoma decyzja.
     let mut ld = Vec::new();
-    let lib32 = bundle.join("lib32");
-    if lib32.is_dir() {
-        ld.push(lib32.to_string_lossy().into_owned());
-    }
     for e in extra_ld {
         ld.push(e.to_string_lossy().into_owned());
     }
