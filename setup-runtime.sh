@@ -1,113 +1,154 @@
-#!/usr/bin/env bash
-# Składa kanoniczny runtime glibc-run w ~/.glibc-run/runtime ze sprawdzonych
-# komponentów zbudowanych podczas portów Claude/Epic/Steam na musl.
-# Uruchamiać NA HOŚCIE (glibc). To runtime narzędzia — ŻADNYCH danych użytkownika.
-set -euo pipefail
-
-RT=${1:-$HOME/.glibc-run/runtime}
-CL=/home/user/.git/claude-desktop-musl/app/glibc      # glibc 64 + GUI + NSS + X11 + 64-bit GL/NVIDIA
-EP=/home/user/.git/epic-musl/app/glibc                # moduły GIO (TLS), webkit
-GPU=/home/user/.git/claude-desktop-musl/gpu-nvidia    # pełny stos NVIDIA 64 + configi
-ST=/home/user/.git/steam-musl/prefix                  # lib32, tools, toolslibs, vulkan, rootfs
-
-mkdir -p "$RT"/lib/lib32 "$RT"/tools "$RT"/toolslibs "$RT"/vulkan "$RT"/rootfs/usr/bin
-
-# 1. Baza 64-bit: bundle Claude'a (zawiera też gdk-pixbuf/, glib-2.0/, hooki NSS)
-cp -a "$CL"/. "$RT"/lib/
-
-# 2. Moduły GIO z bundla Epica (TLS przez glib-networking)
-mkdir -p "$RT"/lib/gio
-cp -a "$EP"/gio/modules "$RT"/lib/gio/
-
-# 2b. Stos WebKitGTK 4.1 z bundla Epica (webkit, soup3, gstreamer…) —
-#     tylko biblioteki, których jeszcze nie ma (bez nadpisywania bazy)
-for so in "$EP"/*.so*; do
-  b=$(basename "$so"); [ -e "$RT/lib/$b" ] || cp -a "$so" "$RT/lib/$b"
-done
-
-# 3. Stos GPU NVIDIA 64 + backendy GBM + configi glvnd/EGL
-cp -an "$GPU"/*.so.* "$RT"/lib/ 2>/dev/null || true
-for l in "$GPU"/*.so.*; do b=$(basename "$l"); [ -e "$RT/lib/$b" ] || cp -L "$l" "$RT/lib/$b"; done
-# symlinki SONAME
-( cd "$RT/lib" && for f in libGLX_nvidia libEGL_nvidia; do ln -sf $f.so.*.* $f.so.0 2>/dev/null || true; done )
-cp -a "$GPU"/gbm "$RT"/lib/
-mkdir -p "$RT"/lib/egl_vendor.d "$RT"/lib/egl_external
-cp "$GPU"/egl_vendor.d/*.json "$RT"/lib/egl_vendor.d/
-cp "$GPU"/egl_external/*.json "$RT"/lib/egl_external/
-
-# 4. Rdzeń 32-bit + 32-bit GL/NVIDIA (ze Steama)
-cp -a "$ST"/lib/lib32/. "$RT"/lib/lib32/
-cp -L "$ST"/lib/ld-linux.so.2 "$RT"/lib/   # loader 32-bit
-
-# 5. Narzędzia GNU + ich odseparowane biblioteki + Vulkan ICD + bash-jako-sh
-cp -a "$ST"/tools/. "$RT"/tools/
-cp -a "$ST"/toolslibs/. "$RT"/toolslibs/
-cp "$ST"/vulkan/*.json "$RT"/vulkan/
-cp -L /usr/bin/bash "$RT"/rootfs/usr/bin/sh
-cp -L /usr/lib64/libtinfo.so.6 "$RT"/lib/ 2>/dev/null || true
-
-# 6. Przepisz ścieżki w loaders.cache i wrapperze tara na runtime
-PB="$RT/lib/gdk-pixbuf"
-if [ -f "$PB/loaders.cache" ]; then
-  sed -i "s|/home/user/.git/claude-desktop-musl/app/glibc/gdk-pixbuf|$PB|g" "$PB/loaders.cache"
-fi
-cat > "$RT/tools/tar" <<EOF
 #!/bin/sh
-export LD_LIBRARY_PATH=$RT/toolslibs\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}
-exec $RT/tools/tar.real "\$@"
-EOF
-chmod +x "$RT/tools/tar"
+# setup-runtime.sh — buduje runtime glibc-run z runtime'ów FLATPAKA.
+#
+# Flatpak jest jedynym uniwersalnym źródłem glibc na systemie musl, więc stąd
+# bierzemy CAŁY glibc-owy userspace: rdzeń + GTK/WebKit (GNOME Platform), GPU
+# (GL.default = Mesa, GL.nvidia-* = dopasowany do jądra), 32-bit (Compat.i386),
+# Vulkan (MangoHud). ZERO zahardkodowanych ścieżek — lokalizacje przez
+# `flatpak info -l`, wersje wykrywane, katalog wyjściowy parametryzowany.
+#
+# Użycie:  setup-runtime.sh [KATALOG_RUNTIME]
+#          (domyślnie $GLIBC_RUN_RUNTIME lub ~/.glibc-run/runtime)
+#
+# Autorstwo: AI (Claude, Anthropic) + właściciel repozytorium.
+set -eu
 
-echo "Runtime: $RT"
-echo "  lib:      $(ls "$RT/lib" | wc -l) pozycji ($(du -sh "$RT/lib" | cut -f1))"
-echo "  lib32:    $(ls "$RT/lib/lib32" | wc -l) pozycji"
-echo "  tools:    $(ls "$RT/tools" | tr '\n' ' ')"
-echo "  vulkan:   $(ls "$RT/vulkan" | tr '\n' ' ')"
-echo "  rootfs:   $(find "$RT/rootfs" -type f | wc -l) plik(ów)"
+RT="${1:-${GLIBC_RUN_RUNTIME:-$HOME/.glibc-run/runtime}}"
+FP="${FLATPAK:-flatpak}"
+REMOTE="${FLATPAK_REMOTE:-flathub}"
+ARCH=x86_64
 
-# --- 7. GPU z runtime'ów flatpaka (uniwersalne: wszystkie sterowniki) -------
-# GL.default = glibc-owa Mesa (AMD/Intel hw, llvmpipe sw, zink) — niezależna
-# od wersji jądra. GL.nvidia-X-Y-Z = glibc userspace NVIDIA dopasowany przez
-# flatpak do modułu w jądrze. Uruchamiać też na maszynie docelowej (musl) —
-# sekcja sama pominie brakujące źródła.
-for base in /var/lib/flatpak/runtime "$HOME/.local/share/flatpak/runtime"; do
-  MS=$(ls -d "$base"/org.freedesktop.Platform.GL.default/x86_64/*/active/files 2>/dev/null | head -1)
-  NV=$(ls -d "$base"/org.freedesktop.Platform.GL.nvidia-*/x86_64/*/active/files 2>/dev/null | head -1)
-  [ -n "$MS" ] || [ -n "$NV" ] && break
-done
-if [ -n "${NV:-}" ]; then
-  nvver=$(basename "$(dirname "$(dirname "$(dirname "$NV")")")" | sed 's/.*GL\.nvidia-//;s/-/./g')
-  find "$RT/lib" -maxdepth 1 -name "*.so.5*" -path '*nvidia*' -delete 2>/dev/null || true
-  find "$RT/lib" -maxdepth 1 \( -name 'libnvidia-*' -o -name 'lib*_nvidia.so*' -o -name 'libcuda*' -o -name 'libnvcuvid*' -o -name 'libnvoptix*' \) ! -newer "$NV/lib" -print0 2>/dev/null | xargs -0r rm -f
-  cp -a "$NV/lib/." "$RT/lib/" 2>/dev/null || true
-  cp -f "$NV"/glvnd/egl_vendor.d/*.json "$RT/lib/egl_vendor.d/" 2>/dev/null || true
-  cp -f "$NV"/egl/egl_external_platform.d/*.json "$RT/lib/egl_external/" 2>/dev/null || true
-  cp -f "$NV"/vulkan/icd.d/*.json "$RT/vulkan/" 2>/dev/null || true
-  echo "  GPU nvidia z flatpaka: $nvver"
+command -v "$FP" >/dev/null || { echo "Potrzebny flatpak (FLATPAK=... by nadpisać)."; exit 1; }
+command -v patchelf >/dev/null || { echo "Potrzebny patchelf (do interpretera helperów WebKita)."; exit 1; }
+
+log() { printf '\033[1m==>\033[0m %s\n' "$*"; }
+
+# Zwraca ścieżkę .../files danego refa; pusto, gdy niezainstalowany.
+files_of() { loc=$("$FP" info -l "$1" 2>/dev/null) && [ -n "$loc" ] && echo "$loc/files"; }
+
+# Najnowszy zainstalowany ref pasujący do prefiksu (np. org.gnome.Platform/x86_64).
+newest_ref() { "$FP" list --runtime --columns=ref 2>/dev/null | grep "^$1" | sort -V | tail -1; }
+
+# Upewnia się, że runtime jest zainstalowany; przy braku instaluje z remote.
+ensure() { # ensure <ref-or-prefix> [pełny-ref-do-instalacji]
+    r=$(newest_ref "$1")
+    if [ -z "$r" ]; then
+        tgt="${2:-$1}"
+        log "Instaluję $tgt z $REMOTE…"
+        "$FP" install -y --noninteractive "$REMOTE" "$tgt" >/dev/null 2>&1 || \
+            "$FP" install -y "$REMOTE" "$tgt"
+        r=$(newest_ref "$1")
+    fi
+    echo "$r"
+}
+
+mkdir -p "$RT"/lib/lib32 "$RT"/loaders "$RT"/tools "$RT"/toolslibs \
+         "$RT"/vulkan "$RT"/etc "$RT"/libexec "$RT"/rootfs/usr/bin \
+         "$RT"/lib/egl_vendor.d "$RT"/lib/egl_external "$RT"/lib/gbm "$RT"/lib/dri
+
+# --- 1. Rdzeń 64-bit: GNOME Platform (glibc + GTK + WebKit + NSS + GIO + pixbuf)
+GNOME_REF=$(ensure "org.gnome.Platform/$ARCH" "org.gnome.Platform")
+GN=$(files_of "$GNOME_REF"); [ -n "$GN" ] || { echo "Brak GNOME Platform"; exit 1; }
+GNLIB="$GN/lib/$ARCH-linux-gnu"
+log "Rdzeń z $GNOME_REF"
+# biblioteki (multiarch -> płaski runtime/lib), bez loaderów
+for f in "$GNLIB"/*.so*; do b=$(basename "$f"); case $b in ld-linux*) ;; *) cp -aL "$f" "$RT/lib/$b" 2>/dev/null || true;; esac; done
+# podkatalogi modułowe
+for d in gdk-pixbuf-2.0 gio gtk-3.0 webkit2gtk-4.1; do [ -d "$GNLIB/$d" ] && cp -aL "$GNLIB/$d" "$RT/lib/" 2>/dev/null || true; done
+# schematy gsettings + glib
+mkdir -p "$RT/lib/glib-2.0/schemas"
+cp -aL "$GN"/share/glib-2.0/schemas/gschemas.compiled "$RT/lib/glib-2.0/schemas/" 2>/dev/null || true
+# cache loaderów gdk-pixbuf z przepisaną ścieżką
+PBC=$(find "$GN"/lib -name loaders.cache -path '*gdk-pixbuf*' 2>/dev/null | head -1)
+if [ -n "$PBC" ]; then
+    mkdir -p "$RT/lib/gdk-pixbuf"
+    sed "s|[^\"]*/gdk-pixbuf-2.0/[0-9.]*/loaders|$RT/lib/gdk-pixbuf-2.0/$(basename "$(dirname "$(dirname "$PBC")")")/loaders|g" "$PBC" > "$RT/lib/gdk-pixbuf/loaders.cache" 2>/dev/null || cp "$PBC" "$RT/lib/gdk-pixbuf/loaders.cache"
 fi
-if [ -n "${MS:-}" ]; then
-  cp -an "$MS"/lib/*.so* "$RT/lib/" 2>/dev/null || true
-  mkdir -p "$RT/lib/dri" && cp -a "$MS/lib/dri/." "$RT/lib/dri/" 2>/dev/null || true
-  cp -f "$MS"/glvnd/egl_vendor.d/50_mesa.json "$RT/lib/egl_vendor.d/" 2>/dev/null || true
-  for j in "$MS"/vulkan/icd.d/*.json; do
-    sed "s|/usr/lib/x86_64-linux-gnu/GL/default/lib/|$RT/lib/|g" "$j" > "$RT/vulkan/$(basename "$j")"
-  done
-  echo "  GPU mesa z flatpaka: $(ls "$RT/lib/dri" | wc -l) sterowników dri"
-fi
-
-# --- 8. Helpery WebKitGTK (Epic i inne appki Tauri/WebKit) ------------------
-# WebKit spawnuje procesy po zaszytej ścieżce /usr/libexec/webkit2gtk-4.1;
-# glibc-run dokłada ją w przestrzeni (overlay lub syntetyczny /usr). Tu tylko
-# kopiujemy helpery do runtime'u i przestawiamy interpreter na standardowy.
-EPLX=/home/user/.git/epic-musl/app/glibc
-if [ -d "$EPLX/libexec" ]; then
-  mkdir -p "$RT/libexec/webkit2gtk-4.1" "$RT/lib/webkit2gtk-4.1/injected-bundle"
-  cp -f "$EPLX"/libexec/WebKit*Process "$RT/libexec/webkit2gtk-4.1/"
-  cp -f "$EPLX"/webkit/injected-bundle/*.so "$RT/lib/webkit2gtk-4.1/injected-bundle/" 2>/dev/null || true
-  if command -v patchelf >/dev/null 2>&1; then
-    for h in "$RT"/libexec/webkit2gtk-4.1/WebKit*; do
-      patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath "$h" 2>/dev/null || true
+# helpery WebKita -> runtime/libexec; interpreter na standardowy (glibc-run go podstawia)
+if [ -d "$GN/libexec/webkit2gtk-4.1" ]; then
+    cp -aL "$GN/libexec/webkit2gtk-4.1" "$RT/libexec/"
+    for h in "$RT"/libexec/webkit2gtk-4.1/WebKit*Process; do
+        [ -f "$h" ] && patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath "$h" 2>/dev/null || true
     done
-  fi
-  echo "  webkit helpery: $(ls "$RT/libexec/webkit2gtk-4.1" | tr '\n' ' ')"
+    mkdir -p "$RT/lib/webkit2gtk-4.1/injected-bundle"
+    cp -aL "$GN"/lib/*/webkit2gtk-4.1/injected-bundle/*.so "$RT/lib/webkit2gtk-4.1/injected-bundle/" 2>/dev/null || true
 fi
+# loader 64-bit -> loaders/ (overlay) ORAZ lib/ (żeby find_loader go znalazł)
+cp -L "$GNLIB/ld-linux-x86-64.so.2" "$RT/loaders/"
+cp -L "$GNLIB/ld-linux-x86-64.so.2" "$RT/lib/"
+# narzędzia GNU + bash-jako-sh
+for t in getopt realpath; do [ -f "$GN/bin/$t" ] && cp -L "$GN/bin/$t" "$RT/tools/"; done
+[ -f "$GN/bin/tar" ] && { cp -L "$GN/bin/tar" "$RT/tools/tar.real"; printf '#!/bin/sh\nexport LD_LIBRARY_PATH=%s/toolslibs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\nexec %s/tools/tar.real "$@"\n' "$RT" "$RT" > "$RT/tools/tar"; chmod +x "$RT/tools/tar"; }
+printf '#!/bin/sh\nexit 0\n' > "$RT/tools/zenity"; chmod +x "$RT/tools/zenity"
+cp -L "$GN/bin/bash" "$RT/rootfs/usr/bin/sh"
+# plik ścieżek musl (okno .musl-lib) — informacyjnie; główny rozdział robi ld.so.cache
+printf '/usr/.musl-lib\n/lib\n/usr/local/lib\n/usr/lib\n' > "$RT/etc/ld-musl-x86_64.path"
+
+# --- 2. GPU 64-bit: Mesa (wszystkie sterowniki) + ewentualnie NVIDIA dopasowana
+GLD=$(files_of "$(ensure "org.freedesktop.Platform.GL.default/$ARCH" "org.freedesktop.Platform.GL.default")")
+if [ -n "$GLD" ]; then
+    log "Mesa (uniwersalna) z GL.default"
+    cp -anL "$GLD"/lib/*.so* "$RT/lib/" 2>/dev/null || true
+    [ -d "$GLD/lib/dri" ] && cp -aL "$GLD"/lib/dri/* "$RT/lib/dri/" 2>/dev/null || true
+    cp -f "$GLD"/glvnd/egl_vendor.d/*mesa*.json "$RT/lib/egl_vendor.d/" 2>/dev/null || true
+    for j in "$GLD"/vulkan/icd.d/*.json; do [ -f "$j" ] && sed "s|/usr/lib/[^\"]*/GL/default/lib/|$RT/lib/|g" "$j" > "$RT/vulkan/$(basename "$j")"; done
+fi
+# NVIDIA: tylko gdy moduł jądra obecny — dopasuj wersję GL.nvidia-X-Y-Z do niego
+if [ -r /proc/driver/nvidia/version ]; then
+    NVVER=$(awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/){print $i; exit}}' /proc/driver/nvidia/version)
+    NVREF_PREFIX="org.freedesktop.Platform.GL.nvidia-$(echo "$NVVER" | tr '.' '-')"
+    NVD=$(files_of "$(ensure "$NVREF_PREFIX/$ARCH" "$NVREF_PREFIX")" 2>/dev/null || true)
+    if [ -n "${NVD:-}" ]; then
+        log "NVIDIA $NVVER (dopasowana do jądra)"
+        cp -anL "$NVD"/lib/*.so* "$RT/lib/" 2>/dev/null || true
+        [ -d "$NVD/lib/gbm" ] && cp -aL "$NVD"/lib/gbm/* "$RT/lib/gbm/" 2>/dev/null || true
+        cp -f "$NVD"/glvnd/egl_vendor.d/*nvidia*.json "$RT/lib/egl_vendor.d/" 2>/dev/null || true
+        cp -f "$NVD"/egl/egl_external_platform.d/*.json "$RT/lib/egl_external/" 2>/dev/null || true
+        cp -f "$NVD"/vulkan/icd.d/*nvidia*.json "$RT/vulkan/" 2>/dev/null || true
+    else
+        echo "   (GL.nvidia-$(echo "$NVVER" | tr '.' '-') niedostępny — zostaje Mesa/software)"
+    fi
+fi
+
+# --- 3. 32-bit (Steam): Compat.i386 + GL32, best-effort
+C32=$(files_of "$(ensure "org.freedesktop.Platform.Compat.i386/$ARCH" "org.freedesktop.Platform.Compat.i386" 2>/dev/null || true)" 2>/dev/null || true)
+if [ -n "${C32:-}" ]; then
+    log "32-bit glibc (Compat.i386)"
+    C32LIB="$C32/lib/i386-linux-gnu"
+    for f in "$C32LIB"/*.so*; do b=$(basename "$f"); case $b in ld-linux*) cp -L "$f" "$RT/loaders/" ;; *) cp -aL "$f" "$RT/lib/lib32/$b" 2>/dev/null || true;; esac; done
+    GL32=$(files_of "$(newest_ref "org.freedesktop.Platform.GL32.default/$ARCH")" 2>/dev/null || true)
+    [ -n "${GL32:-}" ] && cp -anL "$GL32"/lib/*.so* "$RT/lib/lib32/" 2>/dev/null || true
+    if [ -r /proc/driver/nvidia/version ] && [ -n "${NVVER:-}" ]; then
+        NV32=$(files_of "$(newest_ref "org.freedesktop.Platform.GL32.nvidia-$(echo "$NVVER" | tr '.' '-')/$ARCH")" 2>/dev/null || true)
+        [ -n "${NV32:-}" ] && cp -anL "$NV32"/lib/*.so* "$RT/lib/lib32/" 2>/dev/null || true
+    fi
+else
+    echo "   (Compat.i386 niedostępny — Steam 32-bit nie zadziała; apki 64-bit OK)"
+fi
+
+# --- 4. Vulkan MangoHud (opcjonalnie, do nakładki FPS)
+MH=$(files_of "$(newest_ref "org.freedesktop.Platform.VulkanLayer.MangoHud/$ARCH")" 2>/dev/null || true)
+if [ -n "${MH:-}" ]; then
+    mkdir -p "$RT/lib/mangohud"
+    cp -aL "$MH"/lib/$ARCH-linux-gnu/libMangoHud*.so "$RT/lib/mangohud/" 2>/dev/null || true
+fi
+
+# --- 5. ld.so.cache (glibc!) — rdzeń rozdziału światów: overlay niesie TYLKO
+# loadery, a biblioteki glibc rozwiązuje cache; musl-owy loader go nie czyta.
+LDC="$GN/sbin/ldconfig"; [ -x "$LDC" ] || LDC="$GN/usr/sbin/ldconfig"; [ -x "$LDC" ] || LDC=ldconfig
+if "$LDC" -C "$RT/etc/ld.so.cache" -X "$RT/lib" "$RT/lib/lib32" 2>/dev/null; then
+    log "ld.so.cache: $(strings "$RT/etc/ld.so.cache" 2>/dev/null | grep -c "$RT/lib") wpisów"
+else
+    echo "   OSTRZEŻENIE: nie wygenerowano ld.so.cache (sprawdź ldconfig z flatpaka)"
+fi
+
+# rpath $ORIGIN na bibliotekach (żeby znajdowały się wzajemnie niezależnie od cache)
+for so in "$RT"/lib/*.so* "$RT"/lib/lib32/*.so*; do
+    [ -f "$so" ] && patchelf --force-rpath --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
+done
+
+echo
+log "Runtime gotowy: $RT"
+printf '  lib: %s poz. (%s)   lib32: %s   loaders: %s   dri: %s\n' \
+  "$(ls "$RT/lib" | wc -l)" "$(du -sh "$RT/lib" | cut -f1)" \
+  "$(ls "$RT/lib/lib32" 2>/dev/null | wc -l)" "$(ls "$RT/loaders" | wc -l)" "$(ls "$RT/lib/dri" 2>/dev/null | wc -l)"
