@@ -83,6 +83,24 @@ printf '#!/bin/sh\nexit 0\n' > "$RT/tools/zenity"; chmod +x "$RT/tools/zenity"
 cp -L "$GN/bin/bash" "$RT/rootfs/usr/bin/sh"
 # plik ścieżek musl (okno .musl-lib) — informacyjnie; główny rozdział robi ld.so.cache
 printf '/usr/.musl-lib\n/lib\n/usr/local/lib\n/usr/lib\n' > "$RT/etc/ld-musl-x86_64.path"
+# Integracja z pulpitem: pliki, które płaskie `cp *.so*` z GNOME Platform gubi, a bez
+# których GTK/Chromium traci układ przycisków+motyw (dconf) oraz dźwięk (libpulse).
+# libpulsecommon: wymagany przez libpulse.so.0, siedzi w podkatalogu pulseaudio/.
+for f in $(find "$GN/lib" -name 'libpulsecommon-*.so' 2>/dev/null); do cp -fL "$f" "$RT/lib/" 2>/dev/null || true; done
+# dconf: backend GSettings (motyw + gtk-decoration-layout). GNOME Platform go NIE ma —
+# szukamy glibc-owego libdconfsettings.so w zainstalowanych flatpakach / lokalnych bundlach.
+D=$(find "$HOME/.local/share/flatpak" "$HOME"/.git/*musl*/app -name libdconfsettings.so 2>/dev/null | head -1)
+if [ -n "$D" ]; then
+    cp -fL "$D" "$RT/lib/gio/modules/"
+    L=$(find "$HOME/.local/share/flatpak" -name 'libdconf.so.1' 2>/dev/null | head -1); [ -n "$L" ] && cp -fL "$L"* "$RT/lib/"
+    [ -x "$GN/bin/gio-querymodules" ] && "$GN/bin/gio-querymodules" "$RT/lib/gio/modules" 2>/dev/null || true
+else
+    echo "   OSTRZEŻENIE: brak libdconfsettings.so — GTK/Chromium stracą motyw + układ przycisków z dconf"
+fi
+# ALSA -> PipeWire (fallback audio, gdy Chromium nie wejdzie przez pulse).
+mkdir -p "$RT/lib/alsa-lib"
+AP=$(find "$(files_of "$(newest_ref "org.freedesktop.Platform/$ARCH")" 2>/dev/null)" "$GN" -name libasound_module_pcm_pipewire.so 2>/dev/null | head -1)
+[ -n "$AP" ] && cp -fL "$AP" "$RT/lib/alsa-lib/" 2>/dev/null || true
 
 # --- 2. GPU 64-bit: Mesa (wszystkie sterowniki) + ewentualnie NVIDIA dopasowana
 GLD=$(files_of "$(ensure "org.freedesktop.Platform.GL.default/$ARCH" "org.freedesktop.Platform.GL.default")")
