@@ -114,14 +114,19 @@ fi
 C32=$(files_of "$(ensure "org.freedesktop.Platform.Compat.i386/$ARCH" "org.freedesktop.Platform.Compat.i386" 2>/dev/null || true)" 2>/dev/null || true)
 if [ -n "${C32:-}" ]; then
     log "32-bit glibc (Compat.i386)"
-    C32LIB="$C32/lib/i386-linux-gnu"
-    for f in "$C32LIB"/*.so*; do b=$(basename "$f"); case $b in ld-linux*) cp -L "$f" "$RT/loaders/" ;; *) cp -aL "$f" "$RT/lib/lib32/$b" 2>/dev/null || true;; esac; done
-    GL32=$(files_of "$(newest_ref "org.freedesktop.Platform.GL32.default/$ARCH")" 2>/dev/null || true)
-    [ -n "${GL32:-}" ] && cp -anL "$GL32"/lib/*.so* "$RT/lib/lib32/" 2>/dev/null || true
-    if [ -r /proc/driver/nvidia/version ] && [ -n "${NVVER:-}" ]; then
-        NV32=$(files_of "$(newest_ref "org.freedesktop.Platform.GL32.nvidia-$(echo "$NVVER" | tr '.' '-')/$ARCH")" 2>/dev/null || true)
-        [ -n "${NV32:-}" ] && cp -anL "$NV32"/lib/*.so* "$RT/lib/lib32/" 2>/dev/null || true
-    fi
+    # Compat.i386 trzyma biblioteki ORAZ loader 32-bit w korzeniu files/.
+    for f in "$C32"/*.so* "$C32"/ld-linux.so.2; do
+        [ -f "$f" ] || continue; b=$(basename "$f")
+        case $b in ld-linux*) cp -L "$f" "$RT/loaders/"; cp -L "$f" "$RT/lib/lib32/" ;;
+                   *) cp -aL "$f" "$RT/lib/lib32/$b" 2>/dev/null || true;; esac
+    done
+    # GL32 (Mesa + NVIDIA 32-bit): biblioteki w lib/ lub w korzeniu
+    nvtag=$(echo "${NVVER:-0}" | tr '.' '-')
+    for src in "$(files_of "$(newest_ref "org.freedesktop.Platform.GL32.default/$ARCH")" 2>/dev/null)" \
+               "$(files_of "$(newest_ref "org.freedesktop.Platform.GL32.nvidia-$nvtag/$ARCH")" 2>/dev/null)"; do
+        [ -n "$src" ] || continue
+        for sub in lib .; do for f in "$src/$sub"/*.so*; do [ -f "$f" ] && cp -anL "$f" "$RT/lib/lib32/$(basename "$f")" 2>/dev/null || true; done; done
+    done
 else
     echo "   (Compat.i386 niedostępny — Steam 32-bit nie zadziała; apki 64-bit OK)"
 fi
