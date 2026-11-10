@@ -25,6 +25,8 @@ Bez żadnych opcji: runtime z ~/.glibc-run/runtime, tryb natywny (userns+overlay
 środowisko (GPU/glvnd, gdk-pixbuf, gsettings, gio, Vulkan, narzędzia GNU) ustawiane\n\
 automatycznie według zawartości runtime'u — tylko zmienne JESZCZE nieustawione.\n\
 HOME i dane użytkownika pozostają NIETKNIĘTE (jeden home jak zwykle).\n\
+Wewnątrz już działającej przestrzeni glibc-run z tym samym runtime nie zagnieżdża\n\
+userns — robi zwykły exec (znacznik: GLIBC_RUN_NS=<korzeń runtime'u>).\n\
 \n\
 Opcje (zaawansowane):\n\
   --prefix <dir>   Inny katalog runtime (domyślnie ~/.glibc-run/runtime\n\
@@ -406,14 +408,74 @@ fn main() {
             eprintln!("glibc-run: nie ustalono katalogu pakietu glibc (parent loadera)");
             exit(1);
         });
+        // Idempotencja: wywołani WEWNĄTRZ już zmontowanej przestrzeni glibc-run
+        // z TYM SAMYM runtime (glibc-owa aplikacja odpala przez PATH kolejny
+        // owrapowany program). Mounty rodzica już obowiązują — loadery w
+        // /usr/lib, ld.so.cache w /etc, okno /usr/.musl-lib — więc każdy exec
+        // (glibc, musl, skrypt) działa wprost; dyspozycję robi jądro po
+        // PT_INTERP. Zagnieżdżanie kolejnego userns nic nie wnosi, a bywa
+        // limitowane. Znacznik GLIBC_RUN_NS niesie korzeń runtime'u;
+        // wiarygodność potwierdza /usr/.musl-lib, istniejące wyłącznie w
+        // naszej matrycy (ręczny export znacznika poza ns nie wystarczy).
+        let runtime_root = std::fs::canonicalize(&bundle)
+            .ok()
+            .and_then(|b| b.parent().map(Path::to_path_buf));
+        let ns_root = std::env::var_os("GLIBC_RUN_NS")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .and_then(|p| std::fs::canonicalize(p).ok());
+        let inside_same = runtime_root.is_some()
+            && ns_root == runtime_root
+            // żywy bind okna musl (pusty katalog-niedobitek tego nie spełni)
+            && Path::new("/usr/.musl-lib/ld-musl-x86_64.so.1").is_file()
+            // loader glibc faktycznie osiągalny pod ścieżką ABI (overlay aktywny)
+            && Path::new("/lib64/ld-linux-x86-64.so.2").exists();
         if print_only {
-            println!("tryb: native (userns)");
-            println!("bind: {} -> /usr/lib", bundle.display());
+            if inside_same {
+                println!("tryb: native (już w przestrzeni glibc-run — zwykły exec)");
+            } else {
+                println!("tryb: native (userns)");
+                println!("bind: {} -> /usr/lib", bundle.display());
+            }
             println!("exec: {} {}", binary.display(), args.join(" "));
             if let Some(r) = &rootfs {
                 println!("rootfs: {}", r.display());
             }
             exit(0);
+        }
+        if inside_same {
+            // LD_LIBRARY_PATH identycznie jak w native::run — wyłącznie
+            // jawne katalogi z --lib, nigdy nic z runtime'u (lekcja lib32).
+            if user_lib_dirs.is_empty() {
+                std::env::remove_var("LD_LIBRARY_PATH");
+            } else {
+                let ld: Vec<String> = user_lib_dirs
+                    .iter()
+                    .map(|e| e.to_string_lossy().into_owned())
+                    .collect();
+                std::env::set_var("LD_LIBRARY_PATH", ld.join(":"));
+            }
+            if verbose {
+                eprintln!(
+                    "glibc-run: [native] już wewnątrz przestrzeni ({}) — exec bez zagnieżdżania",
+                    runtime_root.as_deref().unwrap_or(Path::new("?")).display()
+                );
+            }
+            use std::os::unix::ffi::OsStrExt;
+            let prog = std::ffi::CString::new(binary.as_os_str().as_bytes()).unwrap();
+            let mut cargv: Vec<std::ffi::CString> = Vec::with_capacity(args.len() + 1);
+            cargv.push(std::ffi::CString::new(argv0.as_bytes()).unwrap());
+            for a in &args {
+                cargv.push(std::ffi::CString::new(a.as_bytes()).unwrap());
+            }
+            let mut ptrs: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
+            ptrs.push(std::ptr::null());
+            unsafe { libc::execv(prog.as_ptr(), ptrs.as_ptr()) };
+            eprintln!(
+                "glibc-run: exec w przestrzeni nie powiódł się: {}",
+                std::io::Error::last_os_error()
+            );
+            exit(127);
         }
         let code = native::run(
             &bundle,

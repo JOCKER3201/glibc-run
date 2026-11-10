@@ -356,8 +356,15 @@ pub fn run(
         std::env::set_var("LD_LIBRARY_PATH", ld.join(":"));
     }
 
-    // Znacznik dla narzędzi/skryptów: jesteśmy w przestrzeni glibc-run.
-    std::env::set_var("GLIBC_RUN_NS", "1");
+    // Znacznik dla narzędzi/skryptów ORAZ idempotencji (main.rs): jesteśmy w
+    // przestrzeni glibc-run; wartość = korzeń runtime'u. Kolejne wywołanie
+    // glibc-run z tym samym runtime (glibc-owa aplikacja odpalająca przez
+    // PATH inny owrapowany program) nie zagnieżdża wtedy userns, tylko robi
+    // zwykły exec — mounty odziedziczone po nas już obowiązują.
+    match bundle.parent() {
+        Some(rt) => std::env::set_var("GLIBC_RUN_NS", rt),
+        None => std::env::set_var("GLIBC_RUN_NS", "1"),
+    }
 
     // Fork: dziecko exec-uje natywnie (jego /proc/self/exe = binarka),
     // rodzic zostaje i PRZEKAZUJE sygnały terminala (Ctrl+C itd.) dziecku.
