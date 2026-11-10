@@ -165,6 +165,26 @@ else
     echo "   OSTRZEŻENIE: nie wygenerowano ld.so.cache (sprawdź ldconfig z flatpaka)"
 fi
 
+# --- 5b. 32-bit glibc w /usr/lib/i386-linux-gnu — cross-arch ldconfig (64-bit
+# z flatpaka) NIE wpisuje 32-bitowego libc.so.6 do ld.so.cache (pomija też kilka
+# innych "well-known": libm/libpthread/ld). 32-bitowy glibc loader wtedy go nie
+# znajduje → pressure-vessel/Steam (capsule-capture-libs i386, reaper) padają z
+# "libc.so.6: cannot open" i exit 127, ZANIM ruszy Proton (brak proton-logu to
+# objaw). Lek: 32-bit glibc w /usr/lib/i386-linux-gnu — to SYSTEMOWA ścieżka
+# glibc loadera i386, której musl NIE przeszukuje (nie zna tripletu; patrzy w
+# /lib, /usr/lib, okno .musl-lib). Overlay niesie loaders/ na /usr/lib, więc
+# loaders/i386-linux-gnu/ → /usr/lib/i386-linux-gnu/. UWAGA: NIE wolno dawać
+# lib32 do LD_LIBRARY_PATH — musl też go czyta i ginie na 32-bit sonamkach
+# (ENOEXEC, zamurowany bash). Symlinki absolutne — jak ld.so.cache wymagają
+# regeneracji po przeniesieniu/rename runtime.
+if [ -d "$RT/lib/lib32" ]; then
+    mkdir -p "$RT/loaders/i386-linux-gnu"
+    for f in "$RT"/lib/lib32/*.so*; do
+        [ -e "$f" ] && ln -sf "$f" "$RT/loaders/i386-linux-gnu/$(basename "$f")"
+    done
+    log "32-bit glibc → /usr/lib/i386-linux-gnu ($(ls "$RT/loaders/i386-linux-gnu" 2>/dev/null | wc -l) bibl., niewidoczne dla musla)"
+fi
+
 # rpath $ORIGIN na bibliotekach (żeby znajdowały się wzajemnie niezależnie od cache)
 for so in "$RT"/lib/*.so* "$RT"/lib/lib32/*.so*; do
     [ -f "$so" ] && patchelf --force-rpath --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
