@@ -1,8 +1,8 @@
-//! glibc-run — uruchamia binarki glibc na systemie musl.
+//! glibc-run — runs glibc binaries on a musl system.
 //!
-//! Jak wine dla aplikacji Windows, ale zamiast reimplementować glibc, nosi ze
-//! sobą prawdziwe glibc (prefix) i uruchamia binarkę przez jego loader. Opcjonalna
-//! warstwa seccomp-notify przekierowuje zaszyte w kodzie ścieżki na nakładkę.
+//! Like wine for Windows applications, but instead of reimplementing glibc it
+//! carries a real glibc (prefix) and runs the binary through its loader. An
+//! optional seccomp-notify layer redirects hardcoded paths to an overlay.
 
 mod elf;
 mod native;
@@ -17,49 +17,49 @@ use runner::LaunchSpec;
 
 fn usage() -> ! {
     eprint!(
-        "glibc-run — uruchamia binarki glibc na systemie musl (jak wine, ale nosi prawdziwe glibc)\n\
+        "glibc-run — runs glibc binaries on a musl system (like wine, but carries the real glibc)\n\
 \n\
-Użycie: glibc-run <binarka|skrypt> [argumenty...]\n\
+Usage: glibc-run <binary|script> [arguments...]\n\
 \n\
-Bez żadnych opcji: runtime z ~/.glibc-run/runtime, tryb natywny (userns+overlay),\n\
-środowisko (GPU/glvnd, gdk-pixbuf, gsettings, gio, Vulkan, narzędzia GNU) ustawiane\n\
-automatycznie według zawartości runtime'u — tylko zmienne JESZCZE nieustawione.\n\
-HOME i dane użytkownika pozostają NIETKNIĘTE (jeden home jak zwykle).\n\
-Wewnątrz już działającej przestrzeni glibc-run z tym samym runtime nie zagnieżdża\n\
-userns — robi zwykły exec (znacznik: GLIBC_RUN_NS=<korzeń runtime'u>).\n\
+With no options: runtime from ~/.glibc-run/runtime, native mode (userns+overlay),\n\
+environment (GPU/glvnd, gdk-pixbuf, gsettings, gio, Vulkan, GNU tools) set up\n\
+automatically from the runtime contents — only variables NOT yet set.\n\
+HOME and user data stay UNTOUCHED (the single usual home).\n\
+Inside an already running glibc-run namespace with the same runtime it does not\n\
+nest a userns — it does a plain exec (marker: GLIBC_RUN_NS=<runtime root>).\n\
 \n\
-Opcje (zaawansowane):\n\
-  --prefix <dir>   Inny katalog runtime (domyślnie ~/.glibc-run/runtime\n\
-                   lub $GLIBC_RUN_PREFIX); oczekuje <dir>/lib, opcjonalnie\n\
+Options (advanced):\n\
+  --prefix <dir>   Alternative runtime directory (default ~/.glibc-run/runtime\n\
+                   or $GLIBC_RUN_PREFIX); expects <dir>/lib, optionally\n\
                    lib/lib32, tools, toolslibs, vulkan, rootfs\n\
-  --lib <dir>      Dodatkowy katalog bibliotek (można wielokrotnie)\n\
-  --rootfs <dir>   Nakładka ścieżek (domyślnie <prefix>/rootfs)\n\
-  --loader <plik>  Jawna ścieżka ld-linux\n\
-  --no-native      Tryb loadera zamiast natywnego (ld.so + --library-path;\n\
-                   /proc/self/exe wskazuje wtedy loader — łamie Electron/CEF)\n\
-  --no-virt        W trybie loadera: bez wirtualizacji ścieżek (seccomp)\n\
-  --no-env         Nie ustawiaj automatycznego środowiska\n\
-  --host <cmd...>  Uruchom polecenie PO SYSTEMOWEMU: czyści środowisko\n\
-                   glibc-run (PATH/tools, GIO/GDK/GL/WebKit, LD_LIBRARY_PATH);\n\
-                   do użycia z wnętrza przestrzeni (terminal w aplikacji)\n\
-  --print          Wypisz plan uruchomienia i zakończ\n\
-  -v, --verbose    Logi diagnostyczne na stderr\n\
-  -h, --help       Ta pomoc\n"
+  --lib <dir>      Extra library directory (may be repeated)\n\
+  --rootfs <dir>   Path overlay (default <prefix>/rootfs)\n\
+  --loader <file>  Explicit ld-linux path\n\
+  --no-native      Loader mode instead of native (ld.so + --library-path;\n\
+                   /proc/self/exe then points at the loader — breaks Electron/CEF)\n\
+  --no-virt        In loader mode: no path virtualization (seccomp)\n\
+  --no-env         Do not set up the automatic environment\n\
+  --host <cmd...>  Run a command THE SYSTEM WAY: clears the glibc-run\n\
+                   environment (PATH/tools, GIO/GDK/GL/WebKit, LD_LIBRARY_PATH);\n\
+                   for use from inside the namespace (a terminal in an app)\n\
+  --print          Print the launch plan and exit\n\
+  -v, --verbose    Diagnostic logs on stderr\n\
+  -h, --help       This help\n"
     );
     exit(2);
 }
 
-/// Ustawia zmienną tylko, gdy użytkownik jej sam nie ustawił.
+/// Sets a variable only if the user has not set it themselves.
 fn setenv_default(key: &str, val: &str) {
     if std::env::var_os(key).is_none() {
         std::env::set_var(key, val);
     }
 }
 
-/// Automatyczne środowisko na podstawie zawartości runtime'u. Nigdy nie rusza
-/// HOME ani XDG_* — dane użytkownika zostają te same co zwykle.
+/// Automatic environment based on the runtime contents. Never touches HOME
+/// or XDG_* — user data stays the same as usual.
 fn auto_env(prefix: &Path, libdir: &Path, verbose: bool) {
-    // Narzędzia GNU (getopt/tar/...) przed BSD-owymi z musl — tylko dopisanie do PATH.
+    // GNU tools (getopt/tar/...) ahead of the musl BSD-style ones — only prepends to PATH.
     let tools = prefix.join("tools");
     if tools.is_dir() {
         let old = std::env::var("PATH").unwrap_or_default();
@@ -77,10 +77,10 @@ fn auto_env(prefix: &Path, libdir: &Path, verbose: bool) {
     set_if("GDK_PIXBUF_MODULEDIR", libdir.join("gdk-pixbuf/loaders"));
     set_if("GSETTINGS_SCHEMA_DIR", libdir.join("glib-2.0/schemas"));
     set_if("GIO_MODULE_DIR", libdir.join("gio/modules"));
-    // Stos GPU NVIDIA — tylko gdy moduł jest w jądrze I wersja userspace
-    // z runtime'u zgadza się z wersją modułu. Przy rozjeździe wymuszanie
-    // vendora daje martwe EGL (ANGLE: "Failed to get system egl display");
-    // lepszy jest czysty fallback na rendering programowy.
+    // NVIDIA GPU stack — only when the module is in the kernel AND the
+    // userspace version from the runtime matches the module version. On a
+    // mismatch, forcing the vendor yields dead EGL (ANGLE: "Failed to get
+    // system egl display"); a clean fallback to software rendering is better.
     let kernel_nv = std::fs::read_to_string("/proc/driver/nvidia/version")
         .ok()
         .and_then(|s| {
@@ -101,8 +101,8 @@ fn auto_env(prefix: &Path, libdir: &Path, verbose: bool) {
         (Some(k), Some(r)) if k == r => true,
         (Some(k), Some(r)) => {
             eprintln!(
-                "glibc-run: NVIDIA w jądrze {k}, w runtime {r} — wersje różne; \
-                 rendering programowy (odśwież runtime pasującym userspace)."
+                "glibc-run: NVIDIA in kernel {k}, in runtime {r} — versions differ; \
+                 software rendering (refresh the runtime with matching userspace)."
             );
             false
         }
@@ -123,8 +123,8 @@ fn auto_env(prefix: &Path, libdir: &Path, verbose: bool) {
             setenv_default("GBM_BACKENDS_PATH", &libdir.join("gbm").to_string_lossy());
         }
     } else if libdir.join("libGLX_mesa.so.0").exists() {
-        // Uniwersalny fallback: Mesa jest niezależna od wersji jądra (stabilne
-        // ABI DRM) — AMD/Intel dostają akcelerację sprzętową, reszta llvmpipe.
+        // Universal fallback: Mesa is independent of the kernel version (stable
+        // DRM ABI) — AMD/Intel get hardware acceleration, the rest llvmpipe.
         setenv_default("__GLX_VENDOR_LIBRARY_NAME", "mesa");
         set_if(
             "__EGL_VENDOR_LIBRARY_FILENAMES",
@@ -132,11 +132,11 @@ fn auto_env(prefix: &Path, libdir: &Path, verbose: bool) {
         );
         set_if("LIBGL_DRIVERS_PATH", libdir.join("dri"));
     }
-    // Vulkan: loader sam pomija ICD-y, których sterownik nie odpowiada —
-    // wszystkie (nvidia + mesa radv/anv/lvp) trafiają w tryb natywny przez
-    // bind na /usr/share/vulkan/icd.d (ścieżka dozwolona w sandboksie
-    // Chromium). Zmienną ustawiamy tylko AWARYJNIE, gdy ten katalog nie
-    // istnieje w systemie (wtedy bind nie ma celu).
+    // Vulkan: the loader itself skips ICDs whose driver does not respond —
+    // all of them (nvidia + mesa radv/anv/lvp) land in native mode via a
+    // bind on /usr/share/vulkan/icd.d (a path allowed by the Chromium
+    // sandbox). The variable is set only as a FALLBACK, when that directory
+    // does not exist on the system (the bind has no target then).
     let vk = prefix.join("vulkan");
     if vk.is_dir() && !Path::new("/usr/share/vulkan/icd.d").is_dir() {
         let mut icds: Vec<String> = Vec::new();
@@ -153,15 +153,15 @@ fn auto_env(prefix: &Path, libdir: &Path, verbose: bool) {
             setenv_default("VK_ICD_FILENAMES", &icds.join(":"));
         }
     }
-    // Aplikacje WebKitGTK: bubblewrap nie wstanie w kontenerze/userns.
+    // WebKitGTK applications: bubblewrap will not start in a container/userns.
     setenv_default("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
-    // WebKit + NVIDIA w kontenerze = zepsuta kompozycja GPU (samo tło).
-    // Domyślnie maluj Skią na CPU i podawaj bufory przez shm — można nadpisać,
-    // ustawiając te zmienne samodzielnie (np. na 0), by testować tor GPU.
+    // WebKit + NVIDIA in a container = broken GPU compositing (background only).
+    // By default paint with Skia on the CPU and pass buffers via shm — can be
+    // overridden by setting these variables yourself (e.g. to 0) to test the GPU path.
     setenv_default("WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1");
     setenv_default("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1");
     if verbose {
-        eprintln!("glibc-run: auto-env z runtime {}", prefix.display());
+        eprintln!("glibc-run: auto-env from runtime {}", prefix.display());
     }
 }
 
@@ -175,7 +175,7 @@ fn find_loader(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Zmienne zarządzane przez auto-env — lista do czyszczenia w trybie --host.
+/// Variables managed by auto-env — the list to clear in --host mode.
 const MANAGED_ENV: &[&str] = &[
     "LD_LIBRARY_PATH",
     "GDK_PIXBUF_MODULE_FILE",
@@ -194,9 +194,10 @@ const MANAGED_ENV: &[&str] = &[
     "WEBKIT_DMABUF_RENDERER_FORCE_SHM",
 ];
 
-/// Tryb --host: wyczyść środowisko glibc-run (env + wpis tools w PATH)
-/// i uruchom polecenie "po systemowemu". Montowania przestrzeni zostają,
-/// ale dzięki oknu .musl-lib i plikowi ld-musl path są dla musl neutralne.
+/// --host mode: clear the glibc-run environment (env vars + the tools entry
+/// in PATH) and run the command "the system way". The namespace mounts stay,
+/// but thanks to the .musl-lib window and the ld-musl path file they are
+/// neutral for musl.
 fn host_mode(cmd: &[String]) -> ! {
     for k in MANAGED_ENV {
         std::env::remove_var(k);
@@ -220,7 +221,7 @@ fn host_mode(cmd: &[String]) -> ! {
         libc::execvp(prog.as_ptr(), ptrs.as_ptr());
     }
     eprintln!(
-        "glibc-run --host: nie udało się uruchomić {}: {}",
+        "glibc-run --host: failed to run {}: {}",
         cmd[0],
         std::io::Error::last_os_error()
     );
@@ -231,7 +232,7 @@ fn main() {
     let raw: Vec<String> = std::env::args().collect();
     if raw.get(1).map(|s| s.as_str()) == Some("--host") {
         if raw.len() < 3 {
-            eprintln!("glibc-run --host <polecenie> [argumenty...]");
+            eprintln!("glibc-run --host <command> [arguments...]");
             exit(2);
         }
         host_mode(&raw[2..]);
@@ -271,7 +272,7 @@ fn main() {
                 loader = Some(PathBuf::from(raw.get(i).unwrap_or_else(|| usage())));
             }
             "--no-virt" => no_virt = true,
-            "--native" => native = true, // domyślne; flaga zostaje dla zgodności
+            "--native" => native = true, // the default; flag kept for compatibility
             "--no-native" => native = false,
             "--no-env" => no_env = true,
             "--print" => print_only = true,
@@ -281,7 +282,7 @@ fn main() {
                 break;
             }
             s if s.starts_with('-') => {
-                eprintln!("glibc-run: nieznana opcja: {s}");
+                eprintln!("glibc-run: unknown option: {s}");
                 usage();
             }
             _ => break,
@@ -290,14 +291,14 @@ fn main() {
     }
 
     if i >= raw.len() {
-        eprintln!("glibc-run: brak binarki do uruchomienia");
+        eprintln!("glibc-run: no binary to run");
         usage();
     }
 
     let binary = PathBuf::from(&raw[i]);
     let args: Vec<String> = raw[i + 1..].to_vec();
 
-    // Rozwiązanie prefixu: <prefix>/lib i <prefix>/rootfs jako domyślne.
+    // Prefix resolution: <prefix>/lib and <prefix>/rootfs as defaults.
     if let Some(pfx) = &prefix {
         let libdir = pfx.join("lib");
         if libdir.is_dir() {
@@ -311,10 +312,10 @@ fn main() {
         }
     }
 
-    // Domyślny runtime: ~/.glibc-run/runtime (sam runtime narzędzia — dane
-    // użytkownika i HOME pozostają nietknięte). Gdy $HOME jest podmienione
-    // (np. launcher aplikacji z piaskownicą), sięgamy po prawdziwy home
-    // użytkownika z passwd — runtime jest jeden, globalny.
+    // Default runtime: ~/.glibc-run/runtime (the tool's own runtime — user
+    // data and HOME stay untouched). When $HOME is substituted (e.g. by a
+    // sandboxed application launcher), we reach for the user's real home
+    // from passwd — there is one global runtime.
     if prefix.is_none() {
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(home) = std::env::var_os("HOME") {
@@ -336,7 +337,7 @@ fn main() {
         }
     }
     if let Some(pfx) = &prefix {
-        // (uzupełnienie dla gałęzi domyślnej — --prefix obsłużono wyżej)
+        // (complement for the default branch — --prefix was handled above)
         let libdir = pfx.join("lib");
         if libdir.is_dir() && !lib_dirs.contains(&libdir) {
             lib_dirs.insert(0, libdir);
@@ -352,7 +353,8 @@ fn main() {
         }
     }
 
-    // Katalog binarki do ścieżki bibliotek (dla sąsiednich .so, np. libEOSSDK).
+    // The binary's directory goes onto the library path (for adjacent .so
+    // files, e.g. libEOSSDK).
     if let Some(parent) = binary.parent() {
         if parent.as_os_str().is_empty() {
             lib_dirs.push(PathBuf::from("."));
@@ -361,7 +363,7 @@ fn main() {
         }
     }
 
-    // Loader: jawny, albo z pierwszego katalogu lib, albo z <prefix>/lib.
+    // Loader: explicit, or from the first lib directory, or from <prefix>/lib.
     let loader = loader
         .or_else(|| lib_dirs.iter().find_map(|d| find_loader(d)))
         .or_else(|| prefix.as_ref().and_then(|p| find_loader(&p.join("lib"))));
@@ -370,18 +372,18 @@ fn main() {
         Some(l) => l,
         None => {
             eprintln!(
-                "glibc-run: nie znaleziono loadera ld-linux. Podaj --loader albo --prefix z katalogiem lib."
+                "glibc-run: ld-linux loader not found. Pass --loader or --prefix with a lib directory."
             );
             exit(1);
         }
     };
 
     if !binary.exists() {
-        eprintln!("glibc-run: binarka nie istnieje: {}", binary.display());
+        eprintln!("glibc-run: binary does not exist: {}", binary.display());
         exit(1);
     }
 
-    // Diagnostyka ELF (nie blokuje, tylko informuje).
+    // ELF diagnostics (informational only, never blocks).
     if verbose {
         match elf::read_elf(&binary) {
             Ok(info) => {
@@ -393,7 +395,7 @@ fn main() {
                     info.needed.len()
                 );
             }
-            Err(e) => eprintln!("glibc-run: ostrzeżenie: nie sparsowano ELF: {e}"),
+            Err(e) => eprintln!("glibc-run: warning: could not parse ELF: {e}"),
         }
     }
 
@@ -402,21 +404,22 @@ fn main() {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| binary.to_string_lossy().into_owned());
 
-    // Tryb natywny: userns + podstawienie loadera, bez pośrednictwa ld.so.
+    // Native mode: userns + loader substitution, no ld.so indirection.
     if native {
         let bundle = loader.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| {
-            eprintln!("glibc-run: nie ustalono katalogu pakietu glibc (parent loadera)");
+            eprintln!("glibc-run: could not determine the glibc bundle directory (loader parent)");
             exit(1);
         });
-        // Idempotencja: wywołani WEWNĄTRZ już zmontowanej przestrzeni glibc-run
-        // z TYM SAMYM runtime (glibc-owa aplikacja odpala przez PATH kolejny
-        // owrapowany program). Mounty rodzica już obowiązują — loadery w
-        // /usr/lib, ld.so.cache w /etc, okno /usr/.musl-lib — więc każdy exec
-        // (glibc, musl, skrypt) działa wprost; dyspozycję robi jądro po
-        // PT_INTERP. Zagnieżdżanie kolejnego userns nic nie wnosi, a bywa
-        // limitowane. Znacznik GLIBC_RUN_NS niesie korzeń runtime'u;
-        // wiarygodność potwierdza /usr/.musl-lib, istniejące wyłącznie w
-        // naszej matrycy (ręczny export znacznika poza ns nie wystarczy).
+        // Idempotency: we were invoked INSIDE an already mounted glibc-run
+        // namespace with the SAME runtime (a glibc application launches
+        // another wrapped program via PATH). The parent's mounts already
+        // apply — loaders in /usr/lib, ld.so.cache in /etc, the
+        // /usr/.musl-lib window — so any exec (glibc, musl, script) works
+        // directly; the kernel dispatches via PT_INTERP. Nesting another
+        // userns adds nothing and is sometimes limited. The GLIBC_RUN_NS
+        // marker carries the runtime root; its credibility is confirmed by
+        // /usr/.musl-lib, which exists only in our synthetic /usr (manually
+        // exporting the marker outside the ns is not enough).
         let runtime_root = std::fs::canonicalize(&bundle)
             .ok()
             .and_then(|b| b.parent().map(Path::to_path_buf));
@@ -426,15 +429,15 @@ fn main() {
             .and_then(|p| std::fs::canonicalize(p).ok());
         let inside_same = runtime_root.is_some()
             && ns_root == runtime_root
-            // żywy bind okna musl (pusty katalog-niedobitek tego nie spełni)
+            // a live bind of the musl window (a leftover empty directory does not qualify)
             && Path::new("/usr/.musl-lib/ld-musl-x86_64.so.1").is_file()
-            // loader glibc faktycznie osiągalny pod ścieżką ABI (overlay aktywny)
+            // the glibc loader actually reachable at the ABI path (overlay active)
             && Path::new("/lib64/ld-linux-x86-64.so.2").exists();
         if print_only {
             if inside_same {
-                println!("tryb: native (już w przestrzeni glibc-run — zwykły exec)");
+                println!("mode: native (already inside a glibc-run namespace — plain exec)");
             } else {
-                println!("tryb: native (userns)");
+                println!("mode: native (userns)");
                 println!("bind: {} -> /usr/lib", bundle.display());
             }
             println!("exec: {} {}", binary.display(), args.join(" "));
@@ -444,8 +447,9 @@ fn main() {
             exit(0);
         }
         if inside_same {
-            // LD_LIBRARY_PATH identycznie jak w native::run — wyłącznie
-            // jawne katalogi z --lib, nigdy nic z runtime'u (lekcja lib32).
+            // LD_LIBRARY_PATH exactly as in native::run — only explicit
+            // directories from --lib, never anything from the runtime (the
+            // lib32 lesson).
             if user_lib_dirs.is_empty() {
                 std::env::remove_var("LD_LIBRARY_PATH");
             } else {
@@ -457,7 +461,7 @@ fn main() {
             }
             if verbose {
                 eprintln!(
-                    "glibc-run: [native] już wewnątrz przestrzeni ({}) — exec bez zagnieżdżania",
+                    "glibc-run: [native] already inside the namespace ({}) — exec without nesting",
                     runtime_root.as_deref().unwrap_or(Path::new("?")).display()
                 );
             }
@@ -472,7 +476,7 @@ fn main() {
             ptrs.push(std::ptr::null());
             unsafe { libc::execv(prog.as_ptr(), ptrs.as_ptr()) };
             eprintln!(
-                "glibc-run: exec w przestrzeni nie powiódł się: {}",
+                "glibc-run: exec inside the namespace failed: {}",
                 std::io::Error::last_os_error()
             );
             exit(127);

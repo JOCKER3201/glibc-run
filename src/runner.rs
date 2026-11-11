@@ -1,12 +1,12 @@
-//! Rdzeń: uruchamia binarkę glibc przez prawdziwy loader z prefixu.
+//! Core: runs a glibc binary through the real loader from the prefix.
 //!
-//! Zamiast patchelfować binarkę, wołamy `ld-linux-x86-64.so.2` jako program
-//! z `--library-path` wskazującym katalog bibliotek prefixu. To eliminuje
-//! potrzebę modyfikowania pliku binarnego.
+//! Instead of patchelf-ing the binary, we invoke `ld-linux-x86-64.so.2` as a
+//! program with `--library-path` pointing at the prefix library directory.
+//! This removes the need to modify the binary file.
 //!
-//! Przy włączonej wirtualizacji ścieżek robimy fork: dziecko instaluje filtr
-//! seccomp i exec-uje loader, a rodzic staje się superwizorem przekierowującym
-//! `openat` na nakładkę `rootfs/`.
+//! With path virtualization enabled we fork: the child installs the seccomp
+//! filter and execs the loader, while the parent becomes a supervisor that
+//! redirects `openat` to the `rootfs/` overlay.
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -28,7 +28,7 @@ pub struct LaunchSpec {
 }
 
 impl LaunchSpec {
-    /// Składa argv dla loadera:
+    /// Builds the loader argv:
     /// [loader, --library-path, <dirs>, --argv0, <argv0>, <binary>, <args...>]
     pub fn loader_argv(&self) -> Vec<String> {
         let libpath = self
@@ -62,14 +62,15 @@ fn exec_loader(loader: &PathBuf, argv: &[String]) -> ! {
         libc::execv(prog.as_ptr(), ptrs.as_ptr());
     }
     eprintln!(
-        "glibc-run: execv loadera nie powiodło się: {}",
+        "glibc-run: loader execv failed: {}",
         std::io::Error::last_os_error()
     );
     std::process::exit(127);
 }
 
-/// Uruchamia według specyfikacji. Nie wraca przy trybie bez wirtualizacji
-/// (zastępuje proces); przy wirtualizacji wraca z kodem wyjścia dziecka.
+/// Runs according to the spec. Does not return in the non-virtualized mode
+/// (it replaces the process); with virtualization it returns the child's
+/// exit code.
 pub fn run(spec: &LaunchSpec) -> i32 {
     let argv = spec.loader_argv();
 
@@ -79,27 +80,27 @@ pub fn run(spec: &LaunchSpec) -> i32 {
 
     let rootfs = match &spec.rootfs {
         Some(r) => r.clone(),
-        None => exec_loader(&spec.loader, &argv), // brak nakładki = nie ma czego wirtualizować
+        None => exec_loader(&spec.loader, &argv), // no overlay = nothing to virtualize
     };
 
-    // Gniazdo do przekazania deskryptora listenera z dziecka do rodzica.
+    // Socket pair to pass the listener descriptor from the child to the parent.
     let mut sv = [0 as libc::c_int; 2];
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
-        eprintln!("glibc-run: socketpair nie powiodło się — uruchamiam bez wirtualizacji");
+        eprintln!("glibc-run: socketpair failed — running without virtualization");
         exec_loader(&spec.loader, &argv);
     }
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        eprintln!("glibc-run: fork nie powiódł się — uruchamiam bez wirtualizacji");
+        eprintln!("glibc-run: fork failed — running without virtualization");
         exec_loader(&spec.loader, &argv);
     }
 
     if pid == 0 {
-        // --- dziecko ---
+        // --- child ---
         unsafe {
             libc::close(sv[0]);
-            // Bez tego nieuprzywilejowany proces nie dostanie listenera.
+            // Without this an unprivileged process will not get the listener.
             libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         }
         let lfd = seccomp::install_listener();
@@ -107,7 +108,7 @@ pub fn run(spec: &LaunchSpec) -> i32 {
             seccomp::send_fd(sv[1], lfd);
         } else {
             eprintln!(
-                "glibc-run: nie udało się założyć filtra seccomp ({}) — bez wirtualizacji ścieżek",
+                "glibc-run: failed to install the seccomp filter ({}) — no path virtualization",
                 std::io::Error::last_os_error()
             );
         }
@@ -117,7 +118,7 @@ pub fn run(spec: &LaunchSpec) -> i32 {
         exec_loader(&spec.loader, &argv);
     }
 
-    // --- rodzic (superwizor) ---
+    // --- parent (supervisor) ---
     unsafe {
         libc::close(sv[1]);
     }

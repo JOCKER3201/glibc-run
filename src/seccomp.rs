@@ -1,20 +1,21 @@
-//! Warstwa seccomp user-notify.
+//! The seccomp user-notify layer.
 //!
-//! Instalujemy filtr BPF, który na syscall `openat` zwraca SECCOMP_RET_USER_NOTIF,
-//! a wszystko inne przepuszcza. Jądro oddaje nam deskryptor listenera; przez niego
-//! superwizor (proces-rodzic) odbiera powiadomienia i może przekierować otwarcie
-//! pliku, wstrzykując własny deskryptor (ADDFD z flagą SEND).
+//! We install a BPF filter that returns SECCOMP_RET_USER_NOTIF for the `openat`
+//! syscall and lets everything else through. The kernel hands us a listener
+//! descriptor; through it the supervisor (the parent process) receives
+//! notifications and can redirect a file open by injecting its own descriptor
+//! (ADDFD with the SEND flag).
 //!
-//! `openat` pokrywa też `open()` z glibc (na x86_64 glibc woła openat). To wystarcza,
-//! by przesłaniać zaszyte w kodzie ścieżki bibliotek, configów i zasobów.
+//! `openat` also covers glibc's `open()` (on x86_64 glibc calls openat). That is
+//! enough to shadow library, config and resource paths hardcoded in the code.
 //!
-//! Ograniczenie konstrukcyjne: seccomp-notify NIE potrafi przepisać argumentu
-//! ścieżki w `execve` — stąd ścieżki helperów typu /usr/libexec trzeba rozwiązać
-//! inaczej (patrz README, sekcja o execve).
+//! Design limitation: seccomp-notify canNOT rewrite the path argument of
+//! `execve` — so helper paths like /usr/libexec have to be solved differently
+//! (see README, the section on execve).
 
 use std::os::unix::io::RawFd;
 
-// Stałe seccomp/BPF (nie wszystkie są w crate libc).
+// seccomp/BPF constants (not all of them are in the libc crate).
 const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_ulong = 1 << 3;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
@@ -22,7 +23,7 @@ const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 const NR_OPENAT: u32 = 257;
 
-// Klasy instrukcji BPF.
+// BPF instruction classes.
 const BPF_LD: u16 = 0x00;
 const BPF_JMP: u16 = 0x05;
 const BPF_RET: u16 = 0x06;
@@ -38,14 +39,14 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
     libc::sock_filter { code, jt, jf, k }
 }
 
-/// Instaluje filtr i zwraca deskryptor listenera (lub -1 przy błędzie).
-/// Wywoływać w dziecku, PO ustawieniu PR_SET_NO_NEW_PRIVS.
+/// Installs the filter and returns the listener descriptor (or -1 on error).
+/// Call in the child, AFTER setting PR_SET_NO_NEW_PRIVS.
 pub fn install_listener() -> RawFd {
-    // Układ (indeksy instrukcji):
-    //   0: załaduj arch (offset 4 w seccomp_data)
-    //   1: jeśli arch != x86_64 -> skok do ALLOW (idx 5)
-    //   2: załaduj nr syscalla (offset 0)
-    //   3: jeśli nr != openat -> skok do ALLOW (idx 5)
+    // Layout (instruction indices):
+    //   0: load arch (offset 4 in seccomp_data)
+    //   1: if arch != x86_64 -> jump to ALLOW (idx 5)
+    //   2: load syscall nr (offset 0)
+    //   3: if nr != openat -> jump to ALLOW (idx 5)
     //   4: RET USER_NOTIF
     //   5: RET ALLOW
     let filter = [
@@ -71,7 +72,7 @@ pub fn install_listener() -> RawFd {
     fd as RawFd
 }
 
-/// Wysyła deskryptor przez gniazdo (SCM_RIGHTS).
+/// Sends a descriptor over a socket (SCM_RIGHTS).
 pub fn send_fd(sock: RawFd, fd: RawFd) -> bool {
     let mut byte = [0u8; 1];
     let mut iov = libc::iovec {
@@ -96,7 +97,7 @@ pub fn send_fd(sock: RawFd, fd: RawFd) -> bool {
     }
 }
 
-/// Odbiera deskryptor z gniazda (SCM_RIGHTS). Zwraca -1 przy braku.
+/// Receives a descriptor from a socket (SCM_RIGHTS). Returns -1 if absent.
 pub fn recv_fd(sock: RawFd) -> RawFd {
     let mut byte = [0u8; 1];
     let mut iov = libc::iovec {

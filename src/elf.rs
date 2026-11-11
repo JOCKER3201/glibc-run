@@ -1,16 +1,16 @@
-//! Minimalny czytnik ELF64: wyciąga PT_INTERP, DT_NEEDED i typ (PIE/EXEC).
-//! Tylko tyle, ile trzeba, by rozpoznać binarkę glibc i podać ją loaderowi.
+//! Minimal ELF64 reader: extracts PT_INTERP, DT_NEEDED and the type (PIE/EXEC).
+//! Just enough to recognize a glibc binary and hand it to the loader.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub struct ElfInfo {
-    /// Ścieżka interpretera z PT_INTERP, np. "/lib64/ld-linux-x86-64.so.2".
+    /// Interpreter path from PT_INTERP, e.g. "/lib64/ld-linux-x86-64.so.2".
     pub interp: Option<String>,
-    /// Lista bibliotek z DT_NEEDED (do diagnostyki i uzupełniania prefixu).
+    /// Libraries from DT_NEEDED (for diagnostics and filling in the prefix).
     pub needed: Vec<String>,
-    /// true dla ET_DYN (PIE), false dla ET_EXEC.
+    /// true for ET_DYN (PIE), false for ET_EXEC.
     pub is_pie: bool,
 }
 
@@ -48,13 +48,13 @@ pub fn read_elf(path: &Path) -> io::Result<ElfInfo> {
     let mut hdr = [0u8; 64];
     f.read_exact(&mut hdr)?;
     if &hdr[0..4] != b"\x7fELF" {
-        return Err(err("to nie jest plik ELF"));
+        return Err(err("not an ELF file"));
     }
     if hdr[4] != 2 {
-        return Err(err("obsługiwane jest tylko ELF64"));
+        return Err(err("only ELF64 is supported"));
     }
     if hdr[5] != 1 {
-        return Err(err("obsługiwany jest tylko little-endian"));
+        return Err(err("only little-endian is supported"));
     }
 
     let e_type = u16::from_le_bytes([hdr[16], hdr[17]]);

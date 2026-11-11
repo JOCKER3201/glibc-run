@@ -1,15 +1,15 @@
-//! Superwizor: pętla obsługi powiadomień seccomp user-notify.
+//! Supervisor: the seccomp user-notify handling loop.
 //!
-//! Dla każdego `openat` czyta ścieżkę z pamięci procesu-celu. Jeśli ścieżka jest
-//! absolutna i istnieje jej odpowiednik w nakładce `rootfs/`, otwiera ten plik u
-//! siebie i wstrzykuje deskryptor do celu (ADDFD z flagą SEND — atomowo instaluje
-//! fd i ustawia go jako wynik syscalla). W przeciwnym razie przepuszcza syscall
-//! natywnie (flaga CONTINUE).
+//! For every `openat` it reads the path from the target process memory. If the
+//! path is absolute and has a counterpart in the `rootfs/` overlay, it opens
+//! that file locally and injects the descriptor into the target (ADDFD with
+//! the SEND flag — atomically installs the fd and sets it as the syscall
+//! result). Otherwise it lets the syscall through natively (CONTINUE flag).
 
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 
-// --- struktury ABI seccomp-notify (repr C) ---
+// --- seccomp-notify ABI structures (repr C) ---
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -49,7 +49,7 @@ struct SeccompNotifAddfd {
 const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
 const SECCOMP_ADDFD_FLAG_SEND: u32 = 2;
 
-// Numery ioctl liczone jak makra _IOC z jądra (asm-generic).
+// ioctl numbers computed like the kernel's _IOC macros (asm-generic).
 const fn ioc(dir: u64, typ: u64, nr: u64, size: u64) -> u64 {
     (dir << 30) | (size << 16) | (typ << 8) | nr
 }
@@ -59,7 +59,7 @@ const NOTIF_SEND: u64 = ioc(3, MAGIC, 1, 24); // _IOWR, sizeof(SeccompNotifResp)
 const NOTIF_ID_VALID: u64 = ioc(1, MAGIC, 2, 8); // _IOW, u64
 const NOTIF_ADDFD: u64 = ioc(1, MAGIC, 3, 24); // _IOW, sizeof(SeccompNotifAddfd)=24
 
-/// Czyta ścieżkę (C-string) z pamięci procesu `pid` spod adresu `addr`.
+/// Reads a path (a C string) from the memory of process `pid` at address `addr`.
 fn read_path(pid: i32, addr: u64) -> Option<String> {
     let mut buf = [0u8; 4096];
     let local = libc::iovec {
@@ -79,7 +79,7 @@ fn read_path(pid: i32, addr: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
-/// Mapuje absolutną ścieżkę systemową na plik w nakładce, jeśli taki istnieje.
+/// Maps an absolute system path to a file in the overlay, if one exists.
 fn map_path(rootfs: &Path, p: &str) -> Option<PathBuf> {
     if !p.starts_with('/') {
         return None;
@@ -116,13 +116,13 @@ fn send_errno(lfd: RawFd, id: u64, errno: i32) {
     }
 }
 
-/// Główna pętla. Zwraca, gdy listener przestaje istnieć (całe drzewo celu padło).
+/// Main loop. Returns when the listener ceases to exist (the whole target tree died).
 pub fn run(lfd: RawFd, rootfs: &Path, verbose: bool) {
     loop {
         let mut req: SeccompNotif = unsafe { std::mem::zeroed() };
         let r = unsafe { libc::ioctl(lfd, NOTIF_RECV as _, &mut req as *mut SeccompNotif) };
         if r != 0 {
-            // ENOENT/EINTR/itp. — zwykle znaczy, że cel zakończył pracę.
+            // ENOENT/EINTR/etc. — usually means the target has exited.
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
@@ -142,10 +142,10 @@ pub fn run(lfd: RawFd, rootfs: &Path, verbose: bool) {
             }
         };
 
-        // Upewnij się, że powiadomienie jest wciąż aktualne, zanim działamy.
+        // Make sure the notification is still valid before we act.
         let valid = unsafe { libc::ioctl(lfd, NOTIF_ID_VALID as _, &req.id as *const u64) };
         if valid != 0 {
-            continue; // nieaktualne — cel już odwołał syscall
+            continue; // stale — the target has already cancelled the syscall
         }
 
         let flags = req.data.args[2] as libc::c_int;
@@ -176,13 +176,13 @@ pub fn run(lfd: RawFd, rootfs: &Path, verbose: bool) {
             libc::close(sfd);
         }
         if newfd < 0 {
-            // ADDFD nie przeszło (np. cel zniknął) — spróbuj przepuścić natywnie.
+            // ADDFD failed (e.g. the target vanished) — try to let it through natively.
             send_continue(lfd, req.id);
         } else if verbose {
             if let Some(p) = path {
-                eprintln!("glibc-run: przekierowano {} -> {}", p, newpath.display());
+                eprintln!("glibc-run: redirected {} -> {}", p, newpath.display());
             }
         }
-        // Przy sukcesie ADDFD-SEND jądro już wysłało odpowiedź; nie wołamy NOTIF_SEND.
+        // On ADDFD-SEND success the kernel has already sent the response; we do not call NOTIF_SEND.
     }
 }

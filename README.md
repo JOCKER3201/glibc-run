@@ -1,104 +1,107 @@
 # glibc-run
 
-Uruchamia binarki **glibc** na systemie **musl** (np. Chimera Linux) — na zasadzie
-wrappera, jak `wine` dla aplikacji Windows. Różnica wobec `wine`: niczego nie
-emulujemy. Binarka glibc mówi do tego samego jądra Linuksa co musl — identyczne
-syscalle. Różni się tylko warstwa userspace (glibc), która jest wolnym
-oprogramowaniem (LGPL) i można ją po prostu **nosić ze sobą** w prefiksie.
-Tam, gdzie `wine` musi reimplementować Windows, `glibc-run` przynosi prawdziwe glibc.
+Runs **glibc** binaries on a **musl** system (e.g. Chimera Linux) — as a
+wrapper, like `wine` for Windows applications. The difference from `wine`:
+nothing is emulated. A glibc binary talks to the same Linux kernel as musl —
+identical syscalls. Only the userspace layer (glibc) differs, and it is free
+software (LGPL) that can simply be **carried along** in a prefix.
+Where `wine` has to reimplement Windows, `glibc-run` brings the real glibc.
 
-To czyni `gcompat` (protezę glibc na musl) zbędnym: zamiast tłumaczyć ABI,
-używamy oryginalnego `ld-linux` i oryginalnych bibliotek.
+This makes `gcompat` (the glibc shim for musl) unnecessary: instead of
+translating the ABI, we use the original `ld-linux` and the original libraries.
 
-> Autorstwo: narzędzie zaprojektowane i napisane przez AI (Claude, Anthropic)
-> we współpracy z właścicielem repozytorium. Zob. nagłówek każdego pliku źródłowego.
+> Authorship: tool designed and written by an AI (Claude, Anthropic)
+> in collaboration with the repository owner. See the header of each source file.
 
-## Jak to działa
+## How it works
 
-Dwie warstwy:
+Two layers:
 
-1. **Rdzeń — uruchomienie przez loader.** Zamiast patchelfować binarkę
-   (`--set-interpreter`), wołamy `ld-linux-x86-64.so.2` jako program:
+1. **Core — launching through the loader.** Instead of patchelf-ing the binary
+   (`--set-interpreter`), we invoke `ld-linux-x86-64.so.2` as a program:
    ```
-   <prefix>/lib/ld-linux-x86-64.so.2 --library-path <prefix>/lib --argv0 <nazwa> <binarka> <args>
+   <prefix>/lib/ld-linux-x86-64.so.2 --library-path <prefix>/lib --argv0 <name> <binary> <args>
    ```
-   Binarka pozostaje nietknięta i tylko do odczytu. Loader i biblioteki glibc
-   leżą w prefiksie (`<prefix>/lib`).
+   The binary stays untouched and read-only. The loader and the glibc
+   libraries live in the prefix (`<prefix>/lib`).
 
-2. **Wirtualizacja ścieżek — seccomp user-notify.** Filtr BPF przechwytuje
-   `openat` i oddaje jądru deskryptor listenera. Proces-superwizor (rodzic) czyta
-   ścieżkę z pamięci celu; jeśli jest absolutna i istnieje jej odpowiednik w
-   nakładce `<prefix>/rootfs`, otwiera ten plik u siebie i **wstrzykuje deskryptor**
-   do celu (ioctl `ADDFD` z flagą `SEND` — atomowo instaluje fd i ustawia go jako
-   wynik syscalla). Reguła jest ogólna: *jeśli plik istnieje w `rootfs`, przesłania
-   systemowy* — bez konfiguracji per-ścieżka. To rozwiązuje klasę problemów z
-   zaszytymi ścieżkami configów i zasobów (`/etc/crypto-policies`, moduły GIO,
-   cache gdk-pixbuf itd.).
+2. **Path virtualization — seccomp user-notify.** A BPF filter intercepts
+   `openat` and the kernel hands over a listener descriptor. The supervisor
+   process (the parent) reads the path from the target's memory; if it is
+   absolute and has a counterpart in the `<prefix>/rootfs` overlay, it opens
+   that file itself and **injects the descriptor** into the target (the `ADDFD`
+   ioctl with the `SEND` flag — atomically installs the fd and sets it as the
+   syscall result). The rule is general: *if a file exists in `rootfs`, it
+   shadows the system one* — no per-path configuration. This solves the class
+   of problems with hardcoded config and resource paths
+   (`/etc/crypto-policies`, GIO modules, the gdk-pixbuf cache, etc.).
 
-Wszystko działa **bez roota, bez patchelf, bez kontenera** — listener seccomp
-dostajemy nieuprzywilejowanie po ustawieniu `PR_SET_NO_NEW_PRIVS`.
+Everything works **without root, without patchelf, without a container** — the
+seccomp listener is obtained unprivileged after setting `PR_SET_NO_NEW_PRIVS`.
 
-## Użycie
+## Usage
 
 ```
-glibc-run <binarka|skrypt> [argumenty aplikacji...]
+glibc-run <binary|script> [application arguments...]
 ```
 
-Zero opcji. Narzędzie samo: znajduje runtime w `~/.glibc-run/runtime`
-(także przy podmienionym $HOME — przez passwd), wybiera tryb natywny
-(userns + overlay), ustawia środowisko według zawartości runtime'u
-(GPU/glvnd/GBM/Vulkan, gdk-pixbuf, gsettings, gio, narzędzia GNU w PATH,
-bash jako /bin/sh w przestrzeni, sandbox WebKita off, rendering WebKita
-na CPU). Ustawia wyłącznie zmienne JESZCZE nieustawione — wszystko można
-nadpisać. **HOME, XDG i dane użytkownika pozostają nietknięte** — aplikacje
-widzą dokładnie ten sam home co zwykle.
+Zero options. The tool by itself: finds the runtime in `~/.glibc-run/runtime`
+(even with a substituted $HOME — via passwd), picks native mode
+(userns + overlay), sets up the environment from the runtime contents
+(GPU/glvnd/GBM/Vulkan, gdk-pixbuf, gsettings, gio, GNU tools in PATH,
+bash as /bin/sh inside the namespace, WebKit sandbox off, WebKit rendering
+on the CPU). It only sets variables NOT yet set — everything can be
+overridden. **HOME, XDG and user data stay untouched** — applications see
+exactly the same home as usual.
 
-Runtime buduje `setup-runtime.sh` (na hoście glibc). Opcje zaawansowane
+The runtime is built by `setup-runtime.sh` (on a glibc host). Advanced options
 (`--prefix`, `--lib`, `--loader`, `--no-native`, `--no-virt`, `--no-env`,
 `--print`, `-v`): `glibc-run --help`.
 
-Budowa (binarka wrappera jest musl-owa, by działała na systemie docelowym):
+Build (the wrapper binary is musl, so that it runs on the target system):
 
 ```
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-## Stan i zasięg
+## Status and scope
 
-Zweryfikowane na Chimera Linux (musl, bez gcompat):
+Verified on Chimera Linux (musl, no gcompat):
 
-| Test | Tryb | Wynik |
+| Test | Mode | Result |
 |---|---|---|
-| Kontrola: binarka glibc wprost na musl | — | `not found` (jak należy) |
-| Rdzeń: `jq` z pełnym closure (libjq/libonig/libm) | loader | działa, liczy filtry |
-| Wirtualizacja: przekierowanie zaszytego `openat` na nakładkę | seccomp | działa |
-| Claude Desktop (nietknięty .deb, Electron, 29 procesów) | `--native` | działa |
+| Control: glibc binary directly on musl | — | `not found` (as expected) |
+| Core: `jq` with its full closure (libjq/libonig/libm) | loader | works, evaluates filters |
+| Virtualization: redirecting a hardcoded `openat` to the overlay | seccomp | works |
+| Claude Desktop (untouched .deb, Electron, 29 processes) | `--native` | works |
 
-### Dwa tryby i dlaczego
+### The two modes and why
 
-Przy uruchomieniu przez loader `/proc/self/exe` wskazuje **loader**, nie binarkę
-(potwierdzone empirycznie). Dla większości programów (np. `jq`) to bez znaczenia —
-tryb domyślny (loader + seccomp-notify) wystarcza i jest najlżejszy: bez roota,
-bez namespace'ów, bez patchelf.
+When launched through the loader, `/proc/self/exe` points at the **loader**,
+not the binary (confirmed empirically). For most programs (e.g. `jq`) this
+does not matter — the default mode (loader + seccomp-notify) is enough and the
+lightest: no root, no namespaces, no patchelf.
 
-Ale **Electron/Chromium** (Claude, Epic) używają `/proc/self/exe`, by (a) znaleźć
-zasoby (`icudtl.dat`) i (b) re-exec-ować się dla procesów potomnych — oba
-założenia łamią się przy uruchomieniu przez loader. `seccomp-notify` nie
-przepisze też ścieżki w `execve` (helpery `/usr/libexec/webkit2gtk-4.1/…`).
+But **Electron/Chromium** (Claude, Epic) use `/proc/self/exe` to (a) find
+resources (`icudtl.dat`) and (b) re-exec themselves for child processes — both
+assumptions break when launching through the loader. `seccomp-notify` also
+cannot rewrite the path in `execve` (helpers like
+`/usr/libexec/webkit2gtk-4.1/…`).
 
-Dlatego tryb **`--native`**: rootless `unshare(NEWUSER|NEWNS)` + bind-mount pakietu
-glibc na `/usr/lib` (gdzie prowadzi `/lib64/ld-linux`). Binarka ładuje się wtedy
-**natywnie**, `/proc/self/exe` = binarka, a self-reexec i ładowanie zasobów
-działają. Zmiana widoczna tylko w tej przestrzeni nazw — system nietknięty.
-Nakładka `rootfs` realizowana bind-mountami (helpery `execve` rozwiązane niejako
-przy okazji).
+Hence the **`--native`** mode: rootless `unshare(NEWUSER|NEWNS)` + a bind-mount
+of the glibc bundle onto `/usr/lib` (where `/lib64/ld-linux` leads). The binary
+then loads **natively**, `/proc/self/exe` = the binary, and self-reexec and
+resource loading work. The change is visible only inside that namespace — the
+system stays untouched. The `rootfs` overlay is realized with bind mounts
+(the `execve` helpers get solved along the way).
 
-Lekcja z integracji: moduły ładowane przez `dlopen` (NSS: `libsoftokn3`,
-`libfreebl3`, `libnssckbi`; moduły GIO; loadery gdk-pixbuf) nie pojawiają się w
-`ldd` — trzeba je dołożyć do pakietu ręcznie, inaczej bind przesłoni systemowe i
-aplikacja padnie (NSS robi to twardym `FATAL`).
+Integration lesson: modules loaded via `dlopen` (NSS: `libsoftokn3`,
+`libfreebl3`, `libnssckbi`; GIO modules; gdk-pixbuf loaders) do not show up in
+`ldd` — they have to be added to the bundle manually, otherwise the bind
+shadows the system ones and the application dies (NSS does it with a hard
+`FATAL`).
 
-## Licencja
+## License
 
-MIT (kod wrappera). Biblioteki glibc w prefiksie pozostają na LGPL i są tylko
-dołączane, nie linkowane statycznie ani modyfikowane.
+MIT (wrapper code). The glibc libraries in the prefix remain under the LGPL
+and are only bundled, not statically linked nor modified.

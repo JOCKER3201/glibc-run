@@ -2,7 +2,7 @@
 name = "glibc-run"
 version = "0.1.3"
 edition = "2021"
-description = "Uruchamia binarki glibc na systemie musl — jak wine, ale nosi prawdziwe glibc"
+description = "Runs glibc binaries on a musl system — like wine, but carries the real glibc"
 license = "MIT"
 
 [[bin]]
