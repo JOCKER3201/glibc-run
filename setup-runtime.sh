@@ -166,19 +166,33 @@ else
     echo "   WARNING: ld.so.cache was not generated (check the flatpak ldconfig)"
 fi
 
-# --- 5b. 32-bit glibc in /usr/lib/i386-linux-gnu — a cross-arch ldconfig (the
-# 64-bit one from flatpak) does NOT put the 32-bit libc.so.6 into ld.so.cache
-# (it also skips a few other "well-known" ones: libm/libpthread/ld). The 32-bit
-# glibc loader then cannot find it → pressure-vessel/Steam (capsule-capture-libs
-# i386, reaper) die with "libc.so.6: cannot open" and exit 127 BEFORE Proton
-# starts (a missing proton log is the symptom). The cure: 32-bit glibc in
-# /usr/lib/i386-linux-gnu — that is the SYSTEM path of the i386 glibc loader,
-# which musl does NOT search (it does not know the triplet; it looks in /lib,
-# /usr/lib, the .musl-lib window). The overlay carries loaders/ onto /usr/lib,
-# so loaders/i386-linux-gnu/ → /usr/lib/i386-linux-gnu/. CAUTION: lib32 must
-# NOT be put into LD_LIBRARY_PATH — musl reads it too and dies on 32-bit
-# sonames (ENOEXEC, a bricked bash). The symlinks are absolute — like
-# ld.so.cache they need regenerating after the runtime is moved/renamed.
+# glibc ldconfig for nested pressure-vessel containers (Steam Linux Runtime).
+# pressure-vessel rebuilds the container's ld.so.cache with the provider's
+# ldconfig, found through PATH and accepted only from a path under /usr; a
+# musl host has just a no-op stub there, which leaves the container without a
+# cache. glibc-run overlays libexec/ on /usr/libexec and puts
+# /usr/libexec/glibc-run on PATH, so this copy is what the containers run. It
+# has to be the static binary from the same glibc as the runtime, hence only
+# the flatpak one qualifies.
+if [ "$LDC" != ldconfig ]; then
+    mkdir -p "$RT/libexec/glibc-run"
+    cp -L "$LDC" "$RT/libexec/glibc-run/ldconfig"
+fi
+
+# --- 5b. 32-bit glibc in /usr/lib/i386-linux-gnu — the SYSTEM path of the
+# i386 glibc loader, which musl does NOT search (it does not know the triplet;
+# it looks in /lib, /usr/lib, the .musl-lib window). The overlay carries
+# loaders/ onto /usr/lib, so loaders/i386-linux-gnu/ → /usr/lib/i386-linux-gnu/.
+# This keeps 32-bit programs working even when the ld.so.cache has holes:
+# pressure-vessel/Steam (capsule-capture-libs i386, reaper) otherwise die with
+# "libc.so.6: cannot open" and exit 127 BEFORE Proton starts (a missing proton
+# log is the symptom). Those holes came from patchelf'ed lib32 files that
+# ldconfig could not parse (see the rpath note at the end of this script), not
+# from cross-arch ldconfig as assumed earlier; the cache is complete now and
+# this stays as a safety net. CAUTION: lib32 must NOT be put into
+# LD_LIBRARY_PATH — musl reads it too and dies on 32-bit sonames (ENOEXEC, a
+# bricked bash). The symlinks are absolute — like ld.so.cache they need
+# regenerating after the runtime is moved/renamed.
 if [ -d "$RT/lib/lib32" ]; then
     mkdir -p "$RT/loaders/i386-linux-gnu"
     for f in "$RT"/lib/lib32/*.so*; do
@@ -188,9 +202,21 @@ if [ -d "$RT/lib/lib32" ]; then
 fi
 
 # $ORIGIN rpath on the libraries (so they find each other independently of the cache)
-for so in "$RT"/lib/*.so* "$RT"/lib/lib32/*.so*; do
+# 64-bit only. When patchelf has to move .dynstr into a new segment, 32-bit
+# libraries end up with a layout that glibc's ldconfig rejects ("file ... is
+# truncated"), which silently drops them from every ld.so.cache built later:
+# the runtime's own when regenerated, and the one pressure-vessel builds inside
+# each container. A third of lib32 went missing that way, libc.so.6 included.
+# lib32 is fully covered by the cache and /usr/lib/i386-linux-gnu, so it does
+# not need the rpath.
+for so in "$RT"/lib/*.so*; do
     [ -f "$so" ] && patchelf --force-rpath --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
 done
+# Guard against the same failure on the 64-bit side.
+if [ "$LDC" != ldconfig ]; then
+    bad=$("$LDC" -v -N -X -f /dev/null "$RT/lib" "$RT/lib/lib32" 2>&1 | grep -c 'is truncated' || true)
+    [ "$bad" -eq 0 ] || echo "   WARNING: $bad libraries are unreadable for ldconfig after patchelf (they will be missing from ld.so.cache)"
+fi
 
 echo
 log "Runtime ready: $RT"

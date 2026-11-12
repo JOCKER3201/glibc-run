@@ -56,9 +56,14 @@ fn setenv_default(key: &str, val: &str) {
     }
 }
 
+/// In-namespace directory for helper binaries that glibc tooling must be able
+/// to find through PATH under /usr. Native mode overlays `<runtime>/libexec`
+/// on /usr/libexec, so `<runtime>/libexec/glibc-run` shows up at this path.
+const NS_HELPER_BIN_DIR: &str = "/usr/libexec/glibc-run";
+
 /// Automatic environment based on the runtime contents. Never touches HOME
 /// or XDG_* — user data stays the same as usual.
-fn auto_env(prefix: &Path, libdir: &Path, verbose: bool) {
+fn auto_env(prefix: &Path, libdir: &Path, native: bool, verbose: bool) {
     // GNU tools (getopt/tar/...) ahead of the musl BSD-style ones — only prepends to PATH.
     let tools = prefix.join("tools");
     if tools.is_dir() {
@@ -66,6 +71,19 @@ fn auto_env(prefix: &Path, libdir: &Path, verbose: bool) {
         let t = tools.to_string_lossy();
         if !old.split(':').any(|p| p == t) {
             std::env::set_var("PATH", format!("{t}:{old}"));
+        }
+    }
+    // Helpers for nested containers. pressure-vessel (Steam Linux Runtime)
+    // rebuilds the container's ld.so.cache with the provider's `ldconfig`,
+    // which it looks up through PATH and only accepts from a path under /usr.
+    // A musl host ships a no-op stub there, so the container ends up without
+    // a cache and breaks as soon as something drops LD_LIBRARY_PATH (SteamVR
+    // does when it starts vrcompositor). The overlay only exists in native
+    // mode, so the entry would point nowhere otherwise.
+    if native && prefix.join("libexec/glibc-run").is_dir() {
+        let old = std::env::var("PATH").unwrap_or_default();
+        if !old.split(':').any(|p| p == NS_HELPER_BIN_DIR) {
+            std::env::set_var("PATH", format!("{NS_HELPER_BIN_DIR}:{old}"));
         }
     }
     let set_if = |key: &str, p: PathBuf| {
@@ -194,8 +212,8 @@ const MANAGED_ENV: &[&str] = &[
     "WEBKIT_DMABUF_RENDERER_FORCE_SHM",
 ];
 
-/// --host mode: clear the glibc-run environment (env vars + the tools entry
-/// in PATH) and run the command "the system way". The namespace mounts stay,
+/// --host mode: clear the glibc-run environment (env vars + the glibc-run
+/// entries in PATH) and run the command "the system way". The namespace mounts stay,
 /// but thanks to the .musl-lib window and the ld-musl path file they are
 /// neutral for musl.
 fn host_mode(cmd: &[String]) -> ! {
@@ -205,7 +223,11 @@ fn host_mode(cmd: &[String]) -> ! {
     if let Ok(path) = std::env::var("PATH") {
         let cleaned: Vec<&str> = path
             .split(':')
-            .filter(|p| !p.contains("/.glibc-run/") && !p.ends_with("/glibc-run/tools"))
+            .filter(|p| {
+                !p.contains("/.glibc-run/")
+                    && !p.ends_with("/glibc-run/tools")
+                    && *p != NS_HELPER_BIN_DIR
+            })
             .collect();
         std::env::set_var("PATH", cleaned.join(":"));
     }
@@ -349,7 +371,7 @@ fn main() {
             }
         }
         if !no_env {
-            auto_env(pfx, &pfx.join("lib"), verbose);
+            auto_env(pfx, &pfx.join("lib"), native, verbose);
         }
     }
 
