@@ -1,5 +1,10 @@
 # glibc-run
 
+> **Archived.** glibc-run is no longer developed. Its successor is
+> [glibc-compat](https://github.com/JOCKER3201/glibc-compat): glibc programs
+> run natively, without a wrapper, from a glibc runtime installed next to
+> musl at the paths it was built for.
+
 Runs **glibc** binaries on a **musl** system (e.g. Chimera Linux) — as a
 wrapper, like `wine` for Windows applications. The difference from `wine`:
 nothing is emulated. A glibc binary talks to the same Linux kernel as musl —
